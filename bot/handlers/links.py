@@ -18,12 +18,14 @@ _LINK_MESSAGE = (
     "Here's your <b>personal invite link</b>. Anyone who joins the group through "
     "it counts as one of your referrals:\n\n"
     "🔗 {link}\n\n"
+    "💰 <b>$250 CASH</b> to whoever brings in the <b>MOST</b> people before the "
+    "contest ends.\n\n"
     "👉 Your mission: <b>refer as many people as possible</b> into the group. "
-    "Share your link everywhere — DMs, your email list, social posts, communities. "
-    "The more people you bring in, the higher you climb.\n\n"
-    "🏆 The person with the most referrals when the contest ends wins the "
-    "<b>cash prize</b> 💰\n\n"
-    "Track your progress any time with /leaderboard."
+    "Share your link everywhere — DMs, your story, social posts, communities. "
+    "The more you bring in, the higher you climb the leaderboard.\n\n"
+    "📊 Check your rank any time with /leaderboard — updated live, and posted in "
+    "the group daily at <b>1pm &amp; 8pm</b>.\n\n"
+    "The race is on. Get sharing. 🔥"
 )
 
 # Shown in the group when the bot can't DM the user yet (they must press Start).
