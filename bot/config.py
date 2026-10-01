@@ -31,6 +31,7 @@ class Config:
     db_path: str
     event_name: str
     prize: str
+    welcome_delete_after: int
     leaderboard_times: tuple[time, ...]
 
     @classmethod
@@ -61,5 +62,6 @@ class Config:
             db_path=os.getenv("DB_PATH", "referrals.db").strip() or "referrals.db",
             event_name=os.getenv("EVENT_NAME", "Webinar").strip() or "Webinar",
             prize=os.getenv("PRIZE", "$100").strip() or "$100",
+            welcome_delete_after=int(os.getenv("WELCOME_DELETE_AFTER", "300").strip() or "300"),
             leaderboard_times=leaderboard_times,
         )
