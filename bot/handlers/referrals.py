@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 from bot.config import Config
 from bot.db import Database
 from bot.handlers.leaderboard import refresh_leaderboard_message
+from bot.handlers.welcome import send_welcome
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ async def track_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if not _just_joined(change):
         return
+
+    await send_welcome(context, change.new_chat_member.user)
 
     invite = change.invite_link
     if invite is None:
