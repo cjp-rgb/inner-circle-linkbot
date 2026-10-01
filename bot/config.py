@@ -30,6 +30,7 @@ class Config:
     leaderboard_chat_id: int | None
     db_path: str
     event_name: str
+    prize: str
     leaderboard_times: tuple[time, ...]
 
     @classmethod
@@ -59,5 +60,6 @@ class Config:
             leaderboard_chat_id=leaderboard_chat_id,
             db_path=os.getenv("DB_PATH", "referrals.db").strip() or "referrals.db",
             event_name=os.getenv("EVENT_NAME", "Webinar").strip() or "Webinar",
+            prize=os.getenv("PRIZE", "$100").strip() or "$100",
             leaderboard_times=leaderboard_times,
         )

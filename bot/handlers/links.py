@@ -14,18 +14,17 @@ from bot.db import Database
 log = logging.getLogger(__name__)
 
 _LINK_MESSAGE = (
-    "🚀 <b>{event} — Referral Contest</b>\n\n"
-    "Here's your <b>personal invite link</b>. Anyone who joins the group through "
-    "it counts as one of your referrals:\n\n"
+    "🚀 <b>{event}: Referral Race</b>\n\n"
+    "Here's your <b>personal invite link</b>. Everyone who joins the chat through "
+    "it counts as your referral:\n\n"
     "🔗 {link}\n\n"
-    "💰 <b>$250 CASH</b> to whoever brings in the <b>MOST</b> people before the "
-    "contest ends.\n\n"
-    "👉 Your mission: <b>refer as many people as possible</b> into the group. "
-    "Share your link everywhere — DMs, your story, social posts, communities. "
-    "The more you bring in, the higher you climb the leaderboard.\n\n"
-    "📊 Check your rank any time with /leaderboard — updated live, and posted in "
-    "the group daily at <b>1pm &amp; 8pm</b>.\n\n"
-    "The race is on. Get sharing. 🔥"
+    "💰 <b>{prize}</b> to whoever brings in the <b>most</b> people before the "
+    "webinar goes live.\n\n"
+    "👉 Invite the people who'd want to see this: friends, family, anyone curious "
+    "about automated trading. Share it in DMs, on your story, wherever.\n\n"
+    "📊 Check your rank any time with /leaderboard. It updates live and is posted "
+    "in the chat daily at <b>1pm &amp; 8pm</b>.\n\n"
+    "Get sharing. 🔥"
 )
 
 # Shown in the group when the bot can't DM the user yet (they must press Start).
@@ -79,10 +78,11 @@ async def _ensure_invite_link(
 async def _send_link_dm(context: ContextTypes.DEFAULT_TYPE, user_id: int, link: str) -> bool:
     """DM the onboarding message + link to the user. Returns False if blocked."""
     event = context.bot_data.get("event_name", "Webinar")
+    prize = context.bot_data.get("prize", "$100")
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text=_LINK_MESSAGE.format(event=event, link=link),
+            text=_LINK_MESSAGE.format(event=event, link=link, prize=prize),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -125,7 +125,9 @@ async def getmylink(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Shouldn't normally happen in a private chat, but fall back gracefully.
         await update.message.reply_text(
             _LINK_MESSAGE.format(
-                event=context.bot_data.get("event_name", "Webinar"), link=link
+                event=context.bot_data.get("event_name", "Webinar"),
+                link=link,
+                prize=context.bot_data.get("prize", "$100"),
             ),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,

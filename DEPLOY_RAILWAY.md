@@ -1,61 +1,48 @@
-# Deploying the Ambassador / Link Bot to Railway
+# Redeploy @TICwebinarbot: The Inner Circle × Breakout Live
 
-Follow these in order. ~15 minutes. Steps marked **[YOU]** only you can do.
+About 15 minutes. Do the steps in order.
 
-## 1. Rotate the bot token  **[YOU]**
-The old token was exposed in a shared zip — it must NOT be reused.
-1. Open Telegram → @BotFather
-2. `/mybots` → pick the link bot → **API Token** → **Revoke current token**
-3. Copy the NEW token. You'll paste it into Railway in step 5.
-   (If you'd rather use a brand-new bot: `/newbot`, name it, copy that token.)
+## 1. Create the webinar group
+1. Create a Telegram group called **The Inner Circle × Breakout Live**.
+2. Add **@TICwebinarbot** and make it an **admin** with "Invite users via link" and "Pin messages" turned on.
+3. Get the group's chat ID: add **@RawDataBot**, copy the `chat id` (a negative number like `-1001234567890`), then remove RawDataBot.
 
-## 2. Get the webinar chat ID  **[YOU]**
-1. Create the webinar Telegram group (named after the brand once decided).
-2. Add the bot to the group as an **admin** (it needs admin to read joins + post the leaderboard).
-3. Temporarily set BOT_TOKEN locally and run `python bot/get_chat_id.py`, OR
-   add @RawDataBot to the group and read the `chat id` (a negative number like -1001234567890). Remove RawDataBot after.
+## 2. Check the bot token
+In @BotFather → `/mybots` → TICwebinarbot → **API Token**. Copy it.
+(If the old token was ever shared anywhere, choose **Revoke** and use the new one.)
 
-## 3. Push this folder to a new private GitHub repo  **[YOU]**
-```
-cd deploy_linkbot
-git init
-git add .
-git commit -m "Ambassador link bot - initial"
-git branch -M main
-git remote add origin https://github.com/cjp-rgb/inner-circle-linkbot.git   # create this repo first (private)
-git push -u origin main
-```
-The .gitignore already excludes .env, the venv and the .db — nothing secret gets committed.
+## 3. Put the updated code on GitHub
+Replace the files in `cjp-rgb/inner-circle-linkbot` with the ones in this zip. The simplest way:
+1. On GitHub, open the repo → **Add file → Upload files**.
+2. Drag in the contents of this zip (the `bot` folder plus the files next to it).
+3. Delete the old duplicate files at the top level of the repo (`config.py`, `db.py`, `links.py`, `leaderboard.py`, `main.py`, `referrals.py`, `get_chat_id.py`, `__init__.py`). The bot only runs the copies inside `bot/`.
+4. Commit.
 
-## 4. Create the Railway service  **[YOU]**
-1. railway.app → sign in with GitHub → **New Project** → **Deploy from GitHub repo**
-2. Pick `inner-circle-linkbot`. Railway auto-detects Python (Nixpacks) and uses the start command in railway.json.
+## 4. Create the Railway service
+1. railway.app → **New Project** → **Deploy from GitHub repo** → `inner-circle-linkbot`.
+2. **Variables**, add each of these:
 
-## 5. Set environment variables in Railway  **[YOU]**
-Project → **Variables** → add each:
 | Variable | Value |
 |---|---|
-| `BOT_TOKEN` | the NEW token from step 1 |
-| `GROUP_ID` | the chat ID from step 2 |
-| `LEADERBOARD_CHAT_ID` | same as GROUP_ID (or a separate channel) |
+| `BOT_TOKEN` | the token from step 2 |
+| `GROUP_ID` | the chat ID from step 1 |
+| `LEADERBOARD_CHAT_ID` | same as `GROUP_ID` |
+| `EVENT_NAME` | `The Inner Circle × Breakout Live` |
+| `PRIZE` | `$100` |
 | `LEADERBOARD_TZ` | `Europe/London` |
 | `LEADERBOARD_TIMES` | `13:00,20:00` |
-| `EVENT_NAME` | `The Inner Circle Webinar` (or final brand name) |
-| `DB_PATH` | `/data/referrals.db`  ← see step 6 |
+| `DB_PATH` | `/data/referrals.db` |
 
-## 6. Add a PERSISTENT VOLUME (critical — do not skip)
-Railway's normal disk wipes on every redeploy. Without a volume, all referral
-counts and the leaderboard reset to zero each time you push or it restarts.
-1. Project → service → **Settings** → **Volumes** → **New Volume**
-2. Mount path: `/data`
-3. Confirm `DB_PATH` (step 5) is set to `/data/referrals.db` so the DB lives on the volume.
+3. **Settings → Volumes → New Volume**, mount path `/data`. Don't skip this: without it the leaderboard resets to zero every time Railway restarts.
+4. Deploy. In the logs you should see `Bot initialised. Group=… prize=$100`.
 
-## 7. Deploy & verify
-1. Railway auto-deploys on push. Watch **Deployments → logs**.
-2. Look for: `Bot initialised. Group=... leaderboard=...` and the scheduled-times line.
-3. In Telegram, DM the bot `/start` → it should reply with your referral link.
-4. `/leaderboard` → should show standings.
-5. Have a test account join via a referral link → confirm the referrer's count goes up.
+## 5. Test before sharing anything
+1. DM @TICwebinarbot `/start` → you get your personal link with the $100 message.
+2. From a second Telegram account, **click** that link to join (don't add it manually; manual adds don't count).
+3. Send `/leaderboard` in the group → you should show 1 referral.
+4. In Railway, hit **Redeploy**, then `/leaderboard` again → still 1 means the volume works.
+5. Remove the test account if you like. Its referral stays credited, so either leave it or run the race knowing you start on 1.
 
-## Updating later
-Push to GitHub `main` → Railway redeploys automatically. The /data volume keeps your data.
+## Notes
+- If you ever point the bot at a different group (new `GROUP_ID`), it automatically clears old links and referral counts and starts a fresh race.
+- To change the prize later, edit the `PRIZE` variable in Railway. No code change needed.

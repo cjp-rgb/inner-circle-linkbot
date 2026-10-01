@@ -17,11 +17,12 @@ _MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 _META_MSG_KEY = "leaderboard_message_id"
 
 
-def _format_leaderboard(rows: list[LeaderboardRow], event: str) -> str:
+def _format_leaderboard(rows: list[LeaderboardRow], event: str, prize: str) -> str:
     if not rows:
         return (
             f"🏆 <b>{event} Referral Leaderboard</b>\n\n"
-            "No referrals yet — be the first! Use /getmylink to grab your link."
+            f"No referrals yet. Be the first! 💰 Top referrer wins <b>{prize}</b>.\n"
+            "Use /getmylink to grab your link."
         )
 
     lines = [f"🏆 <b>{event} Referral Leaderboard</b>\n"]
@@ -29,7 +30,7 @@ def _format_leaderboard(rows: list[LeaderboardRow], event: str) -> str:
         rank = _MEDALS.get(i, f"{i}.")
         plural = "s" if row.referrals != 1 else ""
         lines.append(f"{rank} {row.display_name} — <b>{row.referrals}</b> referral{plural}")
-    lines.append("\n💰 Top referrer wins the cash prize. Use /getmylink to share yours!")
+    lines.append(f"\n💰 Top referrer wins <b>{prize}</b>. Use /getmylink to share yours!")
     return "\n".join(lines)
 
 
@@ -38,9 +39,10 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     db: Database = context.bot_data["db"]
     event = context.bot_data.get("event_name", "Webinar")
+    prize = context.bot_data.get("prize", "$100")
 
     rows = await db.get_leaderboard(limit=10)
-    text = _format_leaderboard(rows, event)
+    text = _format_leaderboard(rows, event, prize)
 
     # Append the caller's own standing if they're not already in the top 10.
     user = update.effective_user
@@ -68,8 +70,9 @@ async def post_scheduled_leaderboard(context: ContextTypes.DEFAULT_TYPE) -> None
 
     db: Database = context.bot_data["db"]
     event = context.bot_data.get("event_name", "Webinar")
+    prize = context.bot_data.get("prize", "$100")
     rows = await db.get_leaderboard(limit=10)
-    text = _format_leaderboard(rows, event)
+    text = _format_leaderboard(rows, event, prize)
 
     try:
         sent = await context.bot.send_message(
@@ -103,8 +106,9 @@ async def refresh_leaderboard_message(context: ContextTypes.DEFAULT_TYPE) -> Non
 
     db: Database = context.bot_data["db"]
     event = context.bot_data.get("event_name", "Webinar")
+    prize = context.bot_data.get("prize", "$100")
     rows = await db.get_leaderboard(limit=10)
-    text = _format_leaderboard(rows, event)
+    text = _format_leaderboard(rows, event, prize)
 
     msg_id_raw = await db.get_meta(_META_MSG_KEY)
     msg_id = int(msg_id_raw) if msg_id_raw else None

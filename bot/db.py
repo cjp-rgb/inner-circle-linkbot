@@ -59,6 +59,28 @@ class Database:
         await self._conn.executescript(_SCHEMA)
         await self._conn.commit()
 
+    async def reset_for_group(self, group_id: int) -> bool:
+        """Start a fresh contest when the bot is pointed at a different group.
+
+        Old invite links belong to the previous group and old referral counts
+        belong to the previous contest, so both are cleared. Returns True if a
+        reset happened.
+        """
+        stored = await self.get_meta("group_id")
+        if stored == str(group_id):
+            return False
+        if stored is not None:
+            await self.conn.execute("DELETE FROM referrals")
+            await self.conn.execute("UPDATE users SET invite_link = NULL")
+            await self.conn.execute("DELETE FROM meta WHERE key = 'leaderboard_message_id'")
+        await self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('group_id', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(group_id),),
+        )
+        await self.conn.commit()
+        return stored is not None
+
     async def close(self) -> None:
         if self._conn is not None:
             await self._conn.close()

@@ -34,8 +34,11 @@ async def _post_init(app: Application) -> None:
     config: Config = app.bot_data["config"]
     db = Database(config.db_path)
     await db.connect()
+    if await db.reset_for_group(config.group_id):
+        log.info("New group detected: previous contest's links and referrals cleared.")
     app.bot_data["db"] = db
     app.bot_data["event_name"] = config.event_name
+    app.bot_data["prize"] = config.prize
 
     await app.bot.set_my_commands(
         [
@@ -58,7 +61,7 @@ async def _post_init(app: Application) -> None:
         posted = ", ".join(t.strftime("%H:%M %Z") for t in config.leaderboard_times)
         log.info("Scheduled leaderboard posts at: %s", posted or "(none)")
 
-    log.info("Bot initialised. Group=%s leaderboard=%s", config.group_id, config.leaderboard_chat_id)
+    log.info("Bot initialised. Group=%s leaderboard=%s prize=%s", config.group_id, config.leaderboard_chat_id, config.prize)
 
 
 async def _post_shutdown(app: Application) -> None:
