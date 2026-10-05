@@ -22,6 +22,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    MessageReactionHandler,
     filters,
 )
 
@@ -71,29 +72,65 @@ def _next_tier_hint(count: int) -> str:
     return "top tier reached 🔥"
 
 
+DIVIDER = "━━━━━━━━━━━━━━━━━━"
+
+
+def _plural(n: int, word: str = "FTD") -> str:
+    return f"{n} {word}{'s' if n != 1 else ''}"
+
+
 def render(rows: list[Row], month: str, final: bool = False) -> str:
-    head = "🏁 <b>FINAL STANDINGS</b>" if final else "🏆 <b>PARTNER LEADERBOARD</b>"
-    total = sum(r.count for r in rows)
-    lines = [head, f"<i>{_month_label(month)}</i> · {total} FTD{'s' if total != 1 else ''} so far" if not final
-             else f"<i>{_month_label(month)}</i> · {total} FTD{'s' if total != 1 else ''} in total", ""]
-    if not rows:
-        lines.append("No partners yet.")
-    rank = 0
-    for i, r in enumerate(rows[:MAX_LINES], start=1):
-        if r.count > 0:
-            rank = i
-            badge = MEDALS.get(rank, f"{rank}.")
-            lines.append(f"{badge} {html.escape(r.name)} · <b>{r.count}</b> · {_tier_text(r.count)}")
-        else:
-            lines.append(f"▫️ {html.escape(r.name)} · 0")
-    if len(rows) > MAX_LINES:
-        lines.append(f"…and {len(rows) - MAX_LINES} more")
-    lines.append("")
+    """Leaderboard text, trimmed so it always fits in one Telegram message (4096 chars)."""
+    limit = MAX_LINES
+    while True:
+        text = _render(rows, month, final, limit)
+        if len(text) <= 4000 or limit <= 5:
+            return text
+        limit -= 5
+
+
+def _render(rows: list[Row], month: str, final: bool, limit: int) -> str:
+    ranked = [r for r in rows if r.count > 0]
+    waiting = [r for r in rows if r.count == 0]
+    total = sum(r.count for r in ranked)
+
     if final:
-        lines.append("Counts have reset for the new month. Good luck! 🚀")
+        lines = ["🏁 <b>FINAL STANDINGS</b> 🏁", f"📅 <i>{_month_label(month)}</i>", "", DIVIDER, ""]
     else:
-        lines.append("Tiers: 1–4 $150 · 5–9 $175 · 10–14 $200 · 15–19 $250 · 20+ $300")
-        lines.append("Updates live with every FTD. Resets on the 1st.")
+        lines = ["🏆 <b>PARTNER LEADERBOARD</b> 🏆", f"📅 <i>{_month_label(month)}</i>", "", DIVIDER, ""]
+
+    if not ranked:
+        lines += ["🚀 No FTDs yet this month.", "First one on the board takes 🥇!", ""]
+    for i, r in enumerate(ranked[:limit], start=1):
+        place = MEDALS.get(i, f"<b>{i}.</b>")
+        lines.append(f"{place} {r.emoji or '⭐'} <b>{html.escape(r.name)}</b>")
+        lines.append(f"      🔥 {_plural(r.count)}  ·  💰 {_tier_text(r.count)}")
+        lines.append("")
+    if len(ranked) > limit:
+        lines += [f"…and {len(ranked) - limit} more on the board", ""]
+
+    if waiting and not final:
+        lines += [DIVIDER, "", "⏳ <b>Still to get started</b>", ""]
+        shown = waiting[:limit]
+        lines += [f"{r.emoji or '⭐'} {html.escape(r.name)}" for r in shown]
+        if len(waiting) > limit:
+            lines.append(f"…and {len(waiting) - limit} more")
+        lines.append("")
+
+    lines += [DIVIDER, "",
+              f"📊 <b>{_plural(total)}</b> {'in total' if final else 'this month'}",
+              f"👥 <b>{len(rows)}</b> partner{'s' if len(rows) != 1 else ''}", ""]
+    if final:
+        lines += ["🔄 The board has reset for the new month.", "Good luck everyone! 🚀"]
+    else:
+        lines += ["💎 <b>TIERS</b>",
+                  "1–4 FTDs → $150",
+                  "5–9 FTDs → $175",
+                  "10–14 FTDs → $200",
+                  "15–19 FTDs → $250",
+                  "20+ FTDs → $300", "",
+                  "⚡ Updates live with every FTD",
+                  "🔄 Resets on the 1st of every month"]
     return "\n".join(lines)
 
 
@@ -188,6 +225,22 @@ async def _rollover_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await check_month_rollover(ctx)
 
 
+async def add_admins(ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Add every (human) admin of the hub to the leaderboard. Returns how many."""
+    cfg, db = _cfg(ctx), _db(ctx)
+    try:
+        admins = await ctx.bot.get_chat_administrators(cfg.group_id)
+    except TelegramError:
+        log.info("Could not list admins")
+        return 0
+    n = 0
+    for a in admins:
+        if _is_person(a.user) and not getattr(a, "is_anonymous", False):
+            await db.upsert_partner(a.user.id, a.user.username, a.user.first_name, active=True)
+            n += 1
+    return n
+
+
 # --- membership -----------------------------------------------------------------
 
 async def on_member_change(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -254,7 +307,54 @@ async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await refresh_board(ctx)
 
 
+async def on_reaction(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Anyone who reacts to any message in the hub is added to the leaderboard (used for roll call)."""
+    r = update.message_reaction
+    if r is None or r.chat.id != _cfg(ctx).group_id or not _is_person(r.user):
+        return
+    if await _db(ctx).upsert_partner(r.user.id, r.user.username, r.user.first_name, active=True):
+        log.info("Partner added via reaction: %s", r.user.id)
+        await refresh_board(ctx)
+
+
 # --- commands -------------------------------------------------------------------
+
+async def cmd_rollcall(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _is_admin(update, ctx):
+        return
+    msg = update.effective_message
+    await add_admins(ctx)
+    await ctx.bot.send_message(
+        _cfg(ctx).group_id,
+        "👋 <b>PARTNER ROLL CALL</b>\n\n"
+        "React to this message with any emoji to be added to the 🏆 Leaderboard.\n\n"
+        "Takes one tap. Do it now so you're on the board before your first FTD! 🚀",
+        message_thread_id=msg.message_thread_id if msg.is_topic_message else None,
+        parse_mode=ParseMode.HTML)
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+    await refresh_board(ctx)
+
+
+async def cmd_removepartner(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _is_admin(update, ctx):
+        return
+    msg = update.effective_message
+    db = _db(ctx)
+    uid = None
+    if msg.reply_to_message and _is_person(msg.reply_to_message.from_user):
+        uid = msg.reply_to_message.from_user.id
+    elif ctx.args:
+        uid = await db.find_by_username(ctx.args[0])
+    if uid is None:
+        await msg.reply_text("Reply to the partner's message, or use /removepartner @username.")
+        return
+    await db.set_active(uid, False)
+    await msg.reply_text("✅ Removed from the leaderboard. Their FTDs this month still count if they have any.")
+    await refresh_board(ctx)
+
 
 async def cmd_setftd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -275,6 +375,7 @@ async def cmd_setleaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await msg.reply_text("Send /setleaderboard inside the Leaderboard topic.")
         return
     db = _db(ctx)
+    await add_admins(ctx)
     await db.set_meta("leaderboard_thread", str(msg.message_thread_id))
     await db.set_meta("board_message_id", "")
     month = _month(_cfg(ctx))
@@ -369,7 +470,9 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "/setleaderboard: run inside the Leaderboard topic\n"
             "/removeftd: reply to an FTD post (or /removeftd @user)\n"
             "/addftd: reply to a partner's message (or /addftd @user)\n"
-            "/addpartner: reply to a partner's message to list them")
+            "/addpartner: reply to a partner's message to list them\n"
+            "/removepartner: reply to a message (or /removepartner @user) to hide someone\n"
+            "/rollcall: post a roll call. Everyone who reacts is added")
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -404,9 +507,11 @@ def build_application(cfg: Config) -> Application:
     for name, fn in (("setftd", cmd_setftd), ("setleaderboard", cmd_setleaderboard),
                      ("addftd", cmd_addftd), ("removeftd", cmd_removeftd),
                      ("addpartner", cmd_addpartner), ("leaderboard", cmd_leaderboard),
-                     ("mystats", cmd_mystats), ("help", cmd_help), ("start", cmd_help)):
+                     ("mystats", cmd_mystats), ("help", cmd_help), ("start", cmd_help),
+                     ("rollcall", cmd_rollcall), ("removepartner", cmd_removepartner)):
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(ChatMemberHandler(on_member_change, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageReactionHandler(on_reaction))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, on_group_message))
     return app
 
