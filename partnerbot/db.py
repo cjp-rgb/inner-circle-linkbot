@@ -1,15 +1,25 @@
 """SQLite storage for partners and their FTDs."""
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 
 import aiosqlite
+
+# Each partner is given one of these when they are added, and keeps it.
+EMOJI_POOL = (
+    "🦁", "🐺", "🦊", "🐯", "🐻", "🐼", "🐨", "🦅", "🦈", "🐉", "🦄", "🐆", "🦍", "🐘", "🦬", "🐎",
+    "🦉", "🐬", "🐙", "🦂", "🐝", "🦋", "🐲", "🦖", "🐊", "🦩", "🦚", "🐧", "🐳", "🦜", "🐸", "🦦",
+    "⚡", "💎", "🚀", "🔱", "⚔️", "🛡️", "👑", "🎯", "🧨", "🌪️", "☄️", "🌋", "🌊", "❄️", "🌙", "☀️",
+    "🍀", "🌵", "🔮", "🎲", "🏹", "🪐", "🧿", "💠", "🗡️", "🪙", "🏎️", "🛸", "🎩", "🧲",
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS partners (
     user_id     INTEGER PRIMARY KEY,
     username    TEXT,
     first_name  TEXT,
+    emoji       TEXT,
     active      INTEGER NOT NULL DEFAULT 1,
     joined_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -37,6 +47,7 @@ class Row:
     username: str | None
     first_name: str | None
     count: int
+    emoji: str | None = None
 
     @property
     def name(self) -> str:
@@ -54,7 +65,15 @@ class Database:
         self._conn = await aiosqlite.connect(self._path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_SCHEMA)
+        async with self._conn.execute("PRAGMA table_info(partners)") as cur:
+            cols = {r["name"] for r in await cur.fetchall()}
+        if "emoji" not in cols:  # databases created before emojis existed
+            await self._conn.execute("ALTER TABLE partners ADD COLUMN emoji TEXT")
         await self._conn.commit()
+        async with self._conn.execute("SELECT user_id FROM partners WHERE emoji IS NULL") as cur:
+            missing = [r["user_id"] for r in await cur.fetchall()]
+        for uid in missing:
+            await self._assign_emoji(uid)
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -80,7 +99,20 @@ class Database:
             (user_id, username, first_name, 1 if active else 0),
         )
         await self.c.commit()
+        await self._assign_emoji(user_id)
         return row is None or (active and row["active"] == 0)
+
+    async def _assign_emoji(self, user_id: int) -> None:
+        """Give a partner a random emoji (unused by others where possible), once."""
+        async with self.c.execute("SELECT emoji FROM partners WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        if row is None or row["emoji"]:
+            return
+        async with self.c.execute("SELECT emoji FROM partners WHERE emoji IS NOT NULL") as cur:
+            used = {r["emoji"] for r in await cur.fetchall()}
+        choices = [e for e in EMOJI_POOL if e not in used] or list(EMOJI_POOL)
+        await self.c.execute("UPDATE partners SET emoji = ? WHERE user_id = ?", (random.choice(choices), user_id))
+        await self.c.commit()
 
     async def set_active(self, user_id: int, active: bool) -> None:
         await self.c.execute("UPDATE partners SET active = ? WHERE user_id = ?", (1 if active else 0, user_id))
@@ -138,7 +170,7 @@ class Database:
     async def standings(self, month: str) -> list[Row]:
         """Every active partner (plus anyone with FTDs this month), best first."""
         async with self.c.execute(
-            """SELECT p.user_id, p.username, p.first_name,
+            """SELECT p.user_id, p.username, p.first_name, p.emoji,
                       COALESCE(SUM(CASE WHEN f.removed = 0 THEN 1 ELSE 0 END), 0) AS n
                FROM partners p
                LEFT JOIN ftds f ON f.user_id = p.user_id AND f.month = ?
@@ -148,7 +180,7 @@ class Database:
             (month,),
         ) as cur:
             rows = await cur.fetchall()
-        return [Row(r["user_id"], r["username"], r["first_name"], r["n"]) for r in rows]
+        return [Row(r["user_id"], r["username"], r["first_name"], r["n"], r["emoji"]) for r in rows]
 
     # meta -------------------------------------------------------------------
     async def get_meta(self, key: str) -> str | None:
