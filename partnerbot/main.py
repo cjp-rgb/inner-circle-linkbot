@@ -155,6 +155,15 @@ def _is_person(user: User | None) -> bool:
     return user is not None and not user.is_bot
 
 
+async def _is_hub_admin(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Whether this user is an admin of the Partner Hub (works from a private chat too)."""
+    try:
+        member = await ctx.bot.get_chat_member(_cfg(ctx).group_id, user_id)
+    except TelegramError:
+        return False
+    return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+
+
 async def _thread(ctx: ContextTypes.DEFAULT_TYPE, key: str) -> int | None:
     raw = await _db(ctx).get_meta(key)
     return int(raw) if raw else None
@@ -211,6 +220,7 @@ async def check_month_rollover(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     previous = await db.get_meta("board_month")
     if previous is None or previous == current:
         return
+    await send_digest(ctx, previous)
     thread = await _thread(ctx, "leaderboard_thread")
     try:
         await ctx.bot.send_message(cfg.group_id, render(await db.standings(previous), previous, final=True),
@@ -219,6 +229,55 @@ async def check_month_rollover(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("Posting final standings failed")
     await _post_board(ctx, render(await db.standings(current), current), current)
     log.info("Month rolled over %s -> %s", previous, current)
+
+
+# --- payout digest (admins only, private) -------------------------------------
+
+def _payout_date(month: str) -> str:
+    y, m = (int(x) for x in month.split("-"))
+    y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return datetime(y, m, 15).strftime("%-d %B %Y")
+
+
+def render_payouts(rows: list[Row], month: str, final: bool) -> str:
+    ranked = [r for r in rows if r.count > 0]
+    title = "💸 <b>PAYOUT DIGEST</b>" if final else "💸 <b>PAYOUTS SO FAR</b>"
+    lines = [title, f"📅 <i>{_month_label(month)}</i>", "", DIVIDER, ""]
+    total_ftds = total_due = 0
+    if not ranked:
+        lines += ["No FTDs logged this month.", ""]
+    for r in ranked:
+        rate = tier_rate(r.count) or 0
+        due = r.count * rate
+        total_ftds += r.count
+        total_due += due
+        lines.append(f"{r.emoji or '⭐'} <b>{html.escape(r.name)}</b>")
+        lines.append(f"      {_plural(r.count)} × ${rate} = <b>${due:,}</b>")
+        lines.append("")
+    lines += [DIVIDER, "",
+              f"📊 <b>{_plural(total_ftds)}</b> across {len(ranked)} partner{'s' if len(ranked) != 1 else ''}",
+              f"💰 <b>Estimated total: ${total_due:,}</b>",
+              f"📆 Due on the 15th: <b>{_payout_date(month)}</b>", "",
+              "⚠️ <i>Estimate from FTDs posted in the hub. Check each one against Kudo's qualified CPAs "
+              "before paying, take off any client-referral splits, and add PU Prime rebates separately.</i>"]
+    return "\n".join(lines)
+
+
+async def _digest_recipients(ctx: ContextTypes.DEFAULT_TYPE) -> set[int]:
+    raw = await _db(ctx).get_meta("digest_recipients")
+    return {int(x) for x in raw.split(",") if x} if raw else set()
+
+
+async def send_digest(ctx: ContextTypes.DEFAULT_TYPE, month: str) -> None:
+    """DM the final payout digest for a month to every admin who has used /payouts."""
+    text = render_payouts(await _db(ctx).standings(month), month, final=True)
+    for uid in await _digest_recipients(ctx):
+        if not await _is_hub_admin(ctx, uid):
+            continue
+        try:
+            await ctx.bot.send_message(uid, text, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            log.info("Could not DM payout digest to %s", uid)
 
 
 async def _rollover_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -461,6 +520,33 @@ async def cmd_mystats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.HTML)
 
 
+async def cmd_payouts(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admins only, in a private chat: estimated payouts for this month (or /payouts YYYY-MM)."""
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if user is None or msg is None:
+        return
+    if chat is None or chat.type != "private":
+        if await _is_hub_admin(ctx, user.id):
+            await msg.reply_text("🔒 Payouts are private. Message me directly and send /payouts.")
+        return
+    if not await _is_hub_admin(ctx, user.id):
+        await msg.reply_text("This command is for Partner Hub admins.")
+        return
+    recipients = await _digest_recipients(ctx)
+    new_recipient = user.id not in recipients
+    if new_recipient:
+        recipients.add(user.id)
+        await _db(ctx).set_meta("digest_recipients", ",".join(str(x) for x in sorted(recipients)))
+    month = _month(_cfg(ctx))
+    if ctx.args and re.fullmatch(r"\d{4}-\d{2}", ctx.args[0]):
+        month = ctx.args[0]
+    final = month != _month(_cfg(ctx))
+    await msg.reply_text(render_payouts(await _db(ctx).standings(month), month, final=final),
+                         parse_mode=ParseMode.HTML)
+    if new_recipient:
+        await msg.reply_text("✅ You'll also get the final digest by DM on the 1st of every month.")
+
+
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = ("<b>Partner Hub bot</b>\n"
             "/leaderboard: this month's standings\n"
@@ -472,7 +558,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "/addftd: reply to a partner's message (or /addftd @user)\n"
             "/addpartner: reply to a partner's message to list them\n"
             "/removepartner: reply to a message (or /removepartner @user) to hide someone\n"
-            "/rollcall: post a roll call. Everyone who reacts is added")
+            "/rollcall: post a roll call. Everyone who reacts is added\n"
+            "/payouts: in a DM with me, estimated payouts (or /payouts 2026-10)")
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -508,7 +595,8 @@ def build_application(cfg: Config) -> Application:
                      ("addftd", cmd_addftd), ("removeftd", cmd_removeftd),
                      ("addpartner", cmd_addpartner), ("leaderboard", cmd_leaderboard),
                      ("mystats", cmd_mystats), ("help", cmd_help), ("start", cmd_help),
-                     ("rollcall", cmd_rollcall), ("removepartner", cmd_removepartner)):
+                     ("rollcall", cmd_rollcall), ("removepartner", cmd_removepartner),
+                     ("payouts", cmd_payouts)):
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(ChatMemberHandler(on_member_change, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageReactionHandler(on_reaction))
