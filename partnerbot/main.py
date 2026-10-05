@@ -1,0 +1,424 @@
+"""Partner Hub bot.
+
+- Adds partners to the leaderboard when they join the hub (or first post in it).
+- Counts every "NEW FTD" post in the FTD topic for the partner who posted it.
+- Keeps one pinned, live leaderboard in the Leaderboard topic, reset monthly.
+"""
+from __future__ import annotations
+
+import asyncio
+import html
+import logging
+import re
+from datetime import datetime, time
+
+from telegram import Update, User
+from telegram.constants import ChatMemberStatus, ParseMode
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    ChatMemberHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from partnerbot.config import Config, tier_rate
+from partnerbot.db import Database, Row
+
+logging.basicConfig(format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("partnerbot")
+
+FTD_RE = re.compile(r"new\s*ftd", re.IGNORECASE)
+DEPOSIT_RE = re.compile(r"\$\s?([\d][\d,.]*)")
+STRATEGY_RE = re.compile(r"strategy\s*:\s*(.+)", re.IGNORECASE)
+MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+MAX_LINES = 60
+IN_GROUP = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
+
+
+# --- helpers ------------------------------------------------------------------
+
+def _cfg(ctx: ContextTypes.DEFAULT_TYPE) -> Config:
+    return ctx.bot_data["config"]
+
+
+def _db(ctx: ContextTypes.DEFAULT_TYPE) -> Database:
+    return ctx.bot_data["db"]
+
+
+def _month(cfg: Config, now: datetime | None = None) -> str:
+    return (now or datetime.now(cfg.tz)).strftime("%Y-%m")
+
+
+def _month_label(month: str) -> str:
+    return datetime.strptime(month, "%Y-%m").strftime("%B %Y")
+
+
+def _tier_text(count: int) -> str:
+    rate = tier_rate(count)
+    return f"${rate} tier" if rate else "no tier yet"
+
+
+def _next_tier_hint(count: int) -> str:
+    for minimum in (1, 5, 10, 15, 20):
+        if count < minimum:
+            gap = minimum - count
+            return f"{gap} more for the ${tier_rate(minimum)} tier"
+    return "top tier reached 🔥"
+
+
+def render(rows: list[Row], month: str, final: bool = False) -> str:
+    head = "🏁 <b>FINAL STANDINGS</b>" if final else "🏆 <b>PARTNER LEADERBOARD</b>"
+    total = sum(r.count for r in rows)
+    lines = [head, f"<i>{_month_label(month)}</i> · {total} FTD{'s' if total != 1 else ''} so far" if not final
+             else f"<i>{_month_label(month)}</i> · {total} FTD{'s' if total != 1 else ''} in total", ""]
+    if not rows:
+        lines.append("No partners yet.")
+    rank = 0
+    for i, r in enumerate(rows[:MAX_LINES], start=1):
+        if r.count > 0:
+            rank = i
+            badge = MEDALS.get(rank, f"{rank}.")
+            lines.append(f"{badge} {html.escape(r.name)} · <b>{r.count}</b> · {_tier_text(r.count)}")
+        else:
+            lines.append(f"▫️ {html.escape(r.name)} · 0")
+    if len(rows) > MAX_LINES:
+        lines.append(f"…and {len(rows) - MAX_LINES} more")
+    lines.append("")
+    if final:
+        lines.append("Counts have reset for the new month. Good luck! 🚀")
+    else:
+        lines.append("Tiers: 1–4 $150 · 5–9 $175 · 10–14 $200 · 15–19 $250 · 20+ $300")
+        lines.append("Updates live with every FTD. Resets on the 1st.")
+    return "\n".join(lines)
+
+
+async def _is_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    msg = update.effective_message
+    chat = update.effective_chat
+    if msg is None or chat is None or chat.id != _cfg(ctx).group_id:
+        return False
+    if msg.sender_chat is not None and msg.sender_chat.id == chat.id:
+        return True  # anonymous group admin
+    user = update.effective_user
+    if user is None:
+        return False
+    try:
+        member = await ctx.bot.get_chat_member(chat.id, user.id)
+    except TelegramError:
+        return False
+    return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+
+
+def _is_person(user: User | None) -> bool:
+    return user is not None and not user.is_bot
+
+
+async def _thread(ctx: ContextTypes.DEFAULT_TYPE, key: str) -> int | None:
+    raw = await _db(ctx).get_meta(key)
+    return int(raw) if raw else None
+
+
+# --- leaderboard message --------------------------------------------------------
+
+async def refresh_board(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Edit the live leaderboard in place (posting and pinning it if needed)."""
+    cfg, db = _cfg(ctx), _db(ctx)
+    thread = await _thread(ctx, "leaderboard_thread")
+    if thread is None:
+        return
+    month = _month(cfg)
+    text = render(await db.standings(month), month)
+    msg_raw = await db.get_meta("board_message_id")
+    if msg_raw and await db.get_meta("board_month") == month:
+        try:
+            await ctx.bot.edit_message_text(text, chat_id=cfg.group_id, message_id=int(msg_raw),
+                                            parse_mode=ParseMode.HTML)
+            return
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return
+            log.info("Leaderboard message unusable (%s); reposting", exc)
+        except TelegramError:
+            log.exception("Editing leaderboard failed; reposting")
+    await _post_board(ctx, text, month)
+
+
+async def _post_board(ctx: ContextTypes.DEFAULT_TYPE, text: str, month: str) -> None:
+    cfg, db = _cfg(ctx), _db(ctx)
+    thread = await _thread(ctx, "leaderboard_thread")
+    try:
+        sent = await ctx.bot.send_message(cfg.group_id, text, message_thread_id=thread,
+                                          parse_mode=ParseMode.HTML)
+    except TelegramError:
+        log.exception("Posting leaderboard failed")
+        return
+    await db.set_meta("board_message_id", str(sent.message_id))
+    await db.set_meta("board_month", month)
+    try:
+        await ctx.bot.pin_chat_message(cfg.group_id, sent.message_id, disable_notification=True)
+    except TelegramError:
+        log.info("Could not pin leaderboard (bot needs Pin Messages)")
+
+
+async def check_month_rollover(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """On a new month: post last month's final standings, then a fresh board."""
+    cfg, db = _cfg(ctx), _db(ctx)
+    if await _thread(ctx, "leaderboard_thread") is None:
+        return
+    current = _month(cfg)
+    previous = await db.get_meta("board_month")
+    if previous is None or previous == current:
+        return
+    thread = await _thread(ctx, "leaderboard_thread")
+    try:
+        await ctx.bot.send_message(cfg.group_id, render(await db.standings(previous), previous, final=True),
+                                   message_thread_id=thread, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        log.exception("Posting final standings failed")
+    await _post_board(ctx, render(await db.standings(current), current), current)
+    log.info("Month rolled over %s -> %s", previous, current)
+
+
+async def _rollover_job(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await check_month_rollover(ctx)
+
+
+# --- membership -----------------------------------------------------------------
+
+async def on_member_change(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    change = update.chat_member
+    if change is None or change.chat.id != _cfg(ctx).group_id:
+        return
+    user = change.new_chat_member.user
+    if not _is_person(user):
+        return
+    was_in = change.old_chat_member.status in IN_GROUP or bool(getattr(change.old_chat_member, "is_member", False))
+    is_in = change.new_chat_member.status in IN_GROUP or bool(getattr(change.new_chat_member, "is_member", False))
+    db = _db(ctx)
+    if is_in and not was_in:
+        await db.upsert_partner(user.id, user.username, user.first_name, active=True)
+        log.info("Partner joined: %s", user.id)
+        await refresh_board(ctx)
+    elif was_in and not is_in:
+        await db.set_active(user.id, False)
+        log.info("Partner left: %s", user.id)
+        await refresh_board(ctx)
+
+
+# --- messages -------------------------------------------------------------------
+
+async def on_group_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    cfg, db = _cfg(ctx), _db(ctx)
+    if msg is None or update.effective_chat is None or update.effective_chat.id != cfg.group_id:
+        return
+    user = update.effective_user
+    if _is_person(user) and msg.sender_chat is None:
+        if await db.upsert_partner(user.id, user.username, user.first_name, active=True):
+            await refresh_board(ctx)
+
+    ftd_thread = await _thread(ctx, "ftd_thread")
+    if ftd_thread is None or msg.message_thread_id != ftd_thread or not msg.is_topic_message:
+        return
+    text = msg.text or msg.caption or ""
+
+    if not FTD_RE.search(text) or not _is_person(user) or msg.sender_chat is not None:
+        return
+
+    month = _month(cfg)
+    before = await db.count(user.id, month)
+    deposit = DEPOSIT_RE.search(text)
+    strategy = STRATEGY_RE.search(text)
+    added = await db.add_ftd(user.id, month, msg.message_id,
+                             f"${deposit.group(1)}" if deposit else None,
+                             strategy.group(1).strip()[:60] if strategy else None)
+    if not added:
+        return
+    after = before + 1
+    log.info("FTD logged for %s (now %s in %s)", user.id, after, month)
+    try:
+        await ctx.bot.set_message_reaction(cfg.group_id, msg.message_id, reaction="🔥")
+    except TelegramError:
+        pass
+    if tier_rate(after) != tier_rate(before):
+        try:
+            await msg.reply_text(f"🎉 {after} FTD{'s' if after != 1 else ''} this month. You've reached the "
+                                 f"<b>${tier_rate(after)} tier</b>!", parse_mode=ParseMode.HTML)
+        except TelegramError:
+            pass
+    await refresh_board(ctx)
+
+
+# --- commands -------------------------------------------------------------------
+
+async def cmd_setftd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not await _is_admin(update, ctx):
+        return
+    if not msg.is_topic_message or msg.message_thread_id is None:
+        await msg.reply_text("Send /setftd inside the FTD Chat topic.")
+        return
+    await _db(ctx).set_meta("ftd_thread", str(msg.message_thread_id))
+    await msg.reply_text("✅ This topic is now the FTD Chat. Every ✅ NEW FTD post here will be counted.")
+
+
+async def cmd_setleaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not await _is_admin(update, ctx):
+        return
+    if not msg.is_topic_message or msg.message_thread_id is None:
+        await msg.reply_text("Send /setleaderboard inside the Leaderboard topic.")
+        return
+    db = _db(ctx)
+    await db.set_meta("leaderboard_thread", str(msg.message_thread_id))
+    await db.set_meta("board_message_id", "")
+    month = _month(_cfg(ctx))
+    await _post_board(ctx, render(await db.standings(month), month), month)
+    try:
+        await msg.delete()
+    except TelegramError:
+        pass
+
+
+async def _target_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int | None:
+    """The partner a command refers to: the replied-to message's author, or an @username argument."""
+    msg = update.effective_message
+    if msg.reply_to_message and _is_person(msg.reply_to_message.from_user):
+        u = msg.reply_to_message.from_user
+        await _db(ctx).upsert_partner(u.id, u.username, u.first_name, active=True)
+        return u.id
+    if ctx.args:
+        return await _db(ctx).find_by_username(ctx.args[0])
+    return None
+
+
+async def cmd_addftd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _is_admin(update, ctx):
+        return
+    uid = await _target_user(update, ctx)
+    if uid is None:
+        await update.effective_message.reply_text("Reply to the partner's message, or use /addftd @username.")
+        return
+    await _db(ctx).add_ftd(uid, _month(_cfg(ctx)), None, None, "added by admin")
+    await update.effective_message.reply_text("✅ FTD added.")
+    await refresh_board(ctx)
+
+
+async def cmd_removeftd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _is_admin(update, ctx):
+        return
+    msg = update.effective_message
+    db = _db(ctx)
+    if msg.reply_to_message:
+        removed = await db.remove_ftd_by_message(msg.reply_to_message.message_id)
+        if removed is None and _is_person(msg.reply_to_message.from_user):
+            removed = msg.reply_to_message.from_user.id if await db.remove_latest_ftd(
+                msg.reply_to_message.from_user.id, _month(_cfg(ctx))) else None
+    elif ctx.args:
+        uid = await db.find_by_username(ctx.args[0])
+        removed = uid if uid and await db.remove_latest_ftd(uid, _month(_cfg(ctx))) else None
+    else:
+        await msg.reply_text("Reply to the FTD post, or use /removeftd @username to remove their latest one.")
+        return
+    await msg.reply_text("🗑 FTD removed." if removed else "Nothing to remove for that partner this month.")
+    if removed:
+        await refresh_board(ctx)
+
+
+async def cmd_addpartner(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _is_admin(update, ctx):
+        return
+    msg = update.effective_message
+    if not msg.reply_to_message or not _is_person(msg.reply_to_message.from_user):
+        await msg.reply_text("Reply to one of the partner's messages with /addpartner.")
+        return
+    u = msg.reply_to_message.from_user
+    await _db(ctx).upsert_partner(u.id, u.username, u.first_name, active=True)
+    await msg.reply_text("✅ Added to the leaderboard.")
+    await refresh_board(ctx)
+
+
+async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    month = _month(_cfg(ctx))
+    await update.effective_message.reply_text(render(await _db(ctx).standings(month), month),
+                                              parse_mode=ParseMode.HTML)
+
+
+async def cmd_mystats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not _is_person(user):
+        return
+    month = _month(_cfg(ctx))
+    n = await _db(ctx).count(user.id, month)
+    await update.effective_message.reply_text(
+        f"📊 <b>{_month_label(month)}</b>\nFTDs: <b>{n}</b> · {_tier_text(n)}\n{_next_tier_hint(n)}",
+        parse_mode=ParseMode.HTML)
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = ("<b>Partner Hub bot</b>\n"
+            "/leaderboard: this month's standings\n"
+            "/mystats: your FTDs and tier\n\n"
+            "<b>Admins</b>\n"
+            "/setftd: run inside the FTD topic\n"
+            "/setleaderboard: run inside the Leaderboard topic\n"
+            "/removeftd: reply to an FTD post (or /removeftd @user)\n"
+            "/addftd: reply to a partner's message (or /addftd @user)\n"
+            "/addpartner: reply to a partner's message to list them")
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# --- app ------------------------------------------------------------------------
+
+async def _post_init(app: Application) -> None:
+    cfg: Config = app.bot_data["config"]
+    db = Database(cfg.db_path)
+    await db.connect()
+    app.bot_data["db"] = db
+    await app.bot.set_my_commands([
+        ("leaderboard", "This month's standings"),
+        ("mystats", "Your FTDs and tier this month"),
+        ("help", "How the bot works"),
+    ])
+    if app.job_queue is not None:
+        app.job_queue.run_daily(_rollover_job, time=time(0, 1, tzinfo=cfg.tz), name="month-rollover")
+        app.job_queue.run_once(_rollover_job, when=5, name="startup-rollover-check")
+    log.info("Partner bot initialised. Group=%s", cfg.group_id)
+
+
+async def _post_shutdown(app: Application) -> None:
+    db: Database | None = app.bot_data.get("db")
+    if db is not None:
+        await db.close()
+
+
+def build_application(cfg: Config) -> Application:
+    app = (ApplicationBuilder().token(cfg.bot_token)
+           .post_init(_post_init).post_shutdown(_post_shutdown).build())
+    app.bot_data["config"] = cfg
+    for name, fn in (("setftd", cmd_setftd), ("setleaderboard", cmd_setleaderboard),
+                     ("addftd", cmd_addftd), ("removeftd", cmd_removeftd),
+                     ("addpartner", cmd_addpartner), ("leaderboard", cmd_leaderboard),
+                     ("mystats", cmd_mystats), ("help", cmd_help), ("start", cmd_help)):
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(ChatMemberHandler(on_member_change, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, on_group_message))
+    return app
+
+
+def main() -> None:
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    cfg = Config.from_env()
+    build_application(cfg).run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
