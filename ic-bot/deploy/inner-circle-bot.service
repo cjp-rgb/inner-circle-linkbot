@@ -1,0 +1,14 @@
+[Unit]
+Description=Inner Circle migration + affiliate invite bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/inner-circle-bot
+ExecStart=/opt/inner-circle-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
