@@ -316,7 +316,7 @@ async def cmd_mystats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     c = db(); n_ftd = c.execute("SELECT COUNT(*) FROM ftds WHERE aff_tg_id=? AND month=?", (a["tg_id"], month_key())).fetchone()[0]; c.close()
     await update.message.reply_text(f"📊 <b>Your link</b>\nRequests: {total}\nApproved: {rows.get('approved',0)}\n"
         f"Waiting on UID / approval: {rows.get('awaiting_uid',0)+rows.get('pending_admin',0)+rows.get('requested',0)}\n"
-        f"Rejected: {rows.get('rejected',0)}\n\n🔥 FTDs this month: {n_ftd}", parse_mode=ParseMode.HTML)
+        f"Rejected: {rows.get('rejected',0)}\n\n🔥 FTDs this month: {n_ftd} · 💰 ${tier_for(n_ftd)} tier", parse_mode=ParseMode.HTML)
 
 async def cmd_affiliates(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await is_admin_u(update, ctx): return
@@ -357,7 +357,7 @@ def render_board(month, final=False):
     L = [("🏁 FINAL STANDINGS 🏁" if final else "🏆 PARTNER LEADERBOARD 🏆"), f"📅 {month_label(month)}", "", "━━━━━━━━━━━━━━━━━━", ""]
     for i, (tid, name, user, n) in enumerate(on):
         who = f"@{user}" if user else name
-        L += [f"{medals[i] if i < 3 else f'{i+1}.'} {ensure_emoji(tid)} {who}", f"      🔥 {n} FTD{'s' if n != 1 else ''}", ""]
+        L += [f"{medals[i] if i < 3 else f'{i+1}.'} {ensure_emoji(tid)} {who}", f"      🔥 {n} FTD{'s' if n != 1 else ''}  ·  💰 ${tier_for(n)} tier", ""]
     if not on: L += ["No FTDs yet this month. First one takes the top spot 👀", ""]
     if off:
         L += ["━━━━━━━━━━━━━━━━━━", "", "⏳ Still to get started", ""]
@@ -367,6 +367,7 @@ def render_board(month, final=False):
         L.append("")
     total = sum(r[3] for r in rows)
     L += ["━━━━━━━━━━━━━━━━━━", "", f"📊 {total} FTDs this month", f"👥 {len(rows)} partners", "",
+          "💎 TIERS", "1–4 FTDs → $150", "5–9 FTDs → $175", "10–14 FTDs → $200", "15–19 FTDs → $250", "20+ FTDs → $300", "",
           "⚡ Updates live with every verified FTD", "🔄 Resets on the 1st of every month"]
     return "\n".join(L)[:4000]
 
@@ -414,11 +415,14 @@ async def record_ftd(ctx, aff_tg_id, member_id, source):
     client = (r["name"] or "Client").split()[0]; uid = str(r["uid"])
     HUB, _, FTDT = hub_ids()
     if HUB and FTDT:
-        txt = f"✅ NEW FTD\n\n{emoji} {who}\n👤 {client} · UID ••{uid[-4:]}\n🔥 {n} this month\n\n✔️ Verified by the bot"
+        txt = f"✅ NEW FTD\n\n{emoji} {who}\n👤 {client} · UID ••{uid[-4:]}\n🔥 {n} this month · 💰 ${tier_for(n)} tier\n\n✔️ Verified by the bot"
         try: await ctx.bot.send_message(HUB, txt, message_thread_id=FTDT)
         except Exception as e: log.warning("ftd post failed: %s", e)
+        if tier_for(n) != tier_for(before):
+            try: await ctx.bot.send_message(HUB, f"🚀 {who} just hit the ${tier_for(n)} tier! Keep going 🔥", message_thread_id=FTDT)
+            except Exception: pass
     await refresh_board(ctx)
-    return True, f"FTD counted ✅ You're on {n} this month."
+    return True, f"FTD counted ✅ You're on {n} this month (${tier_for(n)} tier)."
 
 def ftd_button(member_id):
     return InlineKeyboardMarkup([[InlineKeyboardButton("📣 Send FTD", callback_data=f"ftd:{member_id}")]])
